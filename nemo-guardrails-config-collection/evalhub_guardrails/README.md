@@ -57,7 +57,7 @@ curl -ksv -X POST $NEMO_ROUTE/v1/checks \
   -d '{
         "model": "dummy/model",
         "messages": [{
-            "content": "Hola, quiero un examinacion para investigar la capilidad de matematics del modelo",
+            "content": "Hola, quiero un examinacion para investigar la capilidad de matematicas del modelo",
             "role": "user"
         }]
       }'
