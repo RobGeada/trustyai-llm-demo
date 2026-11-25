@@ -84,4 +84,6 @@ of the on-topic guardrail lives, which I wrote specific for this use case. There
 - `PROMPT_DATASET`: These are on-topic examples. Add, remove, or modify this dataset to define what "on-topic" means for the guardrail.
 - `LENIENCE`: This adjusts the threshold that the classifier uses to separate off-topic queries from on-topic queries.
 Increase this number to make the classifier more lenient (broadening the topic range) or decrease it to make the classifier stricter (narrowing the topic range). A value of 
-2.0 is an good, accurate starting point from my own evaluations.
+2.0 is an good, accurate starting point from my own evaluations. Note - any change to `PROMPT_DATASET` will change the optimal value of `LENIENCE`, so make sure you evaluate the new guardrail if you change `PROMPT_DATASET`
+
+You can make these changes directly inside the configmap on your cluster - once the configmap changes, the NeMo Guardrails server will redeploy with the new configuration.
