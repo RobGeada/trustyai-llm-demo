@@ -1,0 +1,322 @@
+---
+# First, create a ConfigMap with your NeMo Guardrails configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nemo-config-evalhub
+data:
+  config.yaml: |
+    passthrough: true
+    rails:
+      input:
+        flows:
+          - language detector check input
+          - hf classifier check input $classifier="prompt-injection"
+          - on topic classifier check input
+    
+      config:
+        language_detector:
+          allowed_languages:
+            - en
+        hf_classifier:
+          prompt-injection:
+            engine: local
+            model: "RedHatAI/wolf-defender-prompt-injection"
+            task: text-classification
+            threshold: 0.5
+            blocked_labels:
+              - "injection"
+  rails.co: |
+    define flow on topic classifier check input
+      $result = execute on_topic_classifier_check_input
+      if $result.is_blocked
+        bot refuse to respond
+        stop
+
+  actions.py: |
+    import numpy as np
+    import logging
+    from scipy import spatial
+    from typing import Optional
+    
+    from nemoguardrails.actions import action
+    from nemoguardrails.actions.rail_outcome import RailOutcome
+    from nemoguardrails.embeddings.providers.fastembed import FastEmbedEmbeddingModel
+    
+    log = logging.getLogger(__name__)
+    
+    # ==== USER TUNING =====================================================================================================
+    # === LENIENCE ==========
+    # === LENIENCE ==========
+    # Lower the LENIENCE constant to make the classifier STRICTER (will block more prompts)
+    # Increase the LENIENCE constant to make the classifier more LENIENT (will allow more prompts)
+    # Reasonable values range from 0 to 5ish - roughly 2.0 seems to maximize accuracy
+    # LENIENCE < -5.3 will block all prompts
+    # LENIENCE > 16.2 will allow all prompts 
+    LENIENCE = 2.0
+    
+    # === PROMPT DATASET ====
+    # Add, remove, or modify these prompts to define what "on-topic" prompts are.
+    # The classifier will allow similar prompts to those in this dataset.
+    PROMPT_DATASET = [
+        "Design a collection to evaluate an assistant’s factual question answering. Use up to two relevant benchmarks from the live catalog and explain any gaps.",
+        "Design a collection for an enterprise assistant covering safety, instruction following, and long-context understanding. Use at most three relevant catalog benchmarks and explain your choices and any gaps.",
+        "Design a collection to evaluate medical-image diagnosis, such as detecting pneumonia in chest X-rays. Search the live catalog; if no benchmarks directly fit, explain the gap.",
+        "I need a quick baseline for a general-purpose chat assistant. Pick no more than three benchmarks from the live catalog that cover knowledge, reasoning, and following instructions.",
+        "Build an evaluation collection for an assistant that answers everyday commonsense questions, including situations where the most obvious answer is wrong.",
+        "Which catalog benchmarks would help me test multi-step mathematical reasoning in a tutoring assistant? Keep arithmetic and word-problem performance visible separately.",
+        "Create a collection for a science assistant that needs to reason about biology, chemistry, and physics rather than just recall definitions. Explain any coverage gaps.",
+        "Put together a small collection to test whether an assistant follows exact output requirements, such as returning valid JSON, respecting word limits, and including required fields.",
+        "I want to evaluate a conversational assistant's ability to remember preferences and resolve references over several turns. Find relevant catalog benchmarks and flag anything that only tests single-turn behavior.",
+        "Build a collection for an assistant that must ask clarifying questions when a request is ambiguous instead of guessing what the user means.",
+        "Design an evaluation collection for summarizing long reports without losing key facts, inventing conclusions, or ignoring qualifications in the source.",
+        "We are choosing a model for document question answering. Find benchmarks that test whether answers are supported by the supplied documents and whether citations point to the right evidence.",
+        "Create a collection for a retrieval-augmented assistant that should say it cannot answer when the retrieved material does not contain enough evidence.",
+        "I need to test reasoning across several retrieved documents, including cases where the sources disagree. Use up to four relevant live-catalog benchmarks and explain what they miss.",
+        "Build a collection for long-context retrieval: the assistant must find relevant details among many distractors, including information near the beginning and middle of the input.",
+        "Help me evaluate a writing assistant on rewriting, tone control, and preserving meaning. Distinguish benchmarks with objective checks from those requiring human or model judgments.",
+        "Select a compact collection for an English-to-Spanish translation assistant, with attention to meaning preservation, idioms, and specialized terminology. Identify unsupported requirements.",
+        "Create a collection to compare an assistant's question-answering quality in English, Arabic, Hindi, and Japanese. Report language coverage rather than assuming every benchmark supports all four.",
+        "I need benchmarks for a coding assistant that writes Python functions from natural language requirements and passes executable tests. Build a collection using only relevant catalog entries.",
+        "Put together a collection for evaluating code completion in Java, Go, and Rust. Explain any language gaps in the live catalog.",
+        "Design a collection to test a developer assistant's ability to explain unfamiliar code and identify bugs without changing the program.",
+        "Build an evaluation collection for text-to-SQL generation, including joins, aggregation, and questions that cannot be answered from the supplied schema.",
+        "We need to compare models for extracting names, dates, and monetary values from messy business documents into a fixed schema. Find suitable benchmarks and identify gaps.",
+        "Create a collection for an assistant that classifies customer messages by intent and urgency, including messages with more than one intent.",
+        "I want to measure whether a question-answering assistant knows when it might be wrong. Recommend benchmarks for uncertainty calibration and appropriate abstention, not just accuracy.",
+        "Build a collection for a customer-support assistant that must answer from company policy, show empathy, and escalate cases it is not authorized to resolve.",
+        "Design a collection for a healthcare information assistant that answers text-based patient questions accurately without claiming to diagnose or replace a clinician.",
+        "We are evaluating a clinical assistant that summarizes patient notes and identifies medication-related information. Use live-catalog benchmarks and be explicit about missing clinical validation.",
+        "Create a collection for a legal research assistant that answers jurisdiction-specific questions and cites supporting authorities. Do not treat general legal knowledge as proof of citation accuracy.",
+        "I need a collection for a finance assistant that interprets earnings reports, performs calculations, and grounds its answers in tables and accompanying text.",
+        "Build a collection for an insurance assistant that explains coverage and exclusions from policy documents. Prioritize document reasoning over generic financial trivia.",
+        "Find benchmarks for a cybersecurity assistant that explains vulnerabilities and recommends defensive mitigations. Include a way to assess unsafe guidance if the catalog supports it.",
+        "Create a collection for a software operations assistant that interprets logs and proposes likely causes of incidents. Flag the gap if the catalog only covers general coding knowledge.",
+        "Design an evaluation collection for an educational tutor that gives useful hints without immediately revealing the answer and corrects a student's misconceptions.",
+        "Build a collection for a human-resources assistant that explains workplace policies consistently while protecting employee privacy and avoiding discriminatory recommendations.",
+        "I need to assess a retail assistant that compares products using supplied specifications and never invents stock levels, prices, or warranty terms.",
+        "Create a collection for a travel-planning assistant that respects budget, accessibility needs, dates, and conflicting traveler preferences. Explain where static benchmarks fall short.",
+        "Select benchmarks for an automotive assistant that answers vehicle safety questions and interprets maintenance guidance. Identify any requirements needing specialist evaluation beyond the catalog.",
+        "Build a collection for an assistant that reasons about scientific papers, distinguishes findings from speculation, and does not fabricate references.",
+        "We need an evaluation collection for a public-services assistant that explains eligibility rules in plain language and handles incomplete applicant information appropriately.",
+        "Create a collection for an e-commerce assistant that reads product photos as well as descriptions. Search the live catalog and clearly separate text-only coverage from visual understanding.",
+        "Design a safety collection for a public-facing assistant covering harmful instructions, harassment, and illegal activity. Use up to three catalog benchmarks and explain their limitations.",
+        "I want to test whether a model refuses benign requests just because they mention sensitive topics. Build a collection that measures over-refusal as well as unsafe compliance.",
+        "Create a collection to evaluate jailbreak resistance across direct requests, role-play, and multi-turn persuasion. Do not assume success on one attack style generalizes to the others.",
+        "Build a collection for prompt-injection resistance when an assistant reads untrusted web pages or retrieved documents containing instructions to ignore its user.",
+        "Find benchmarks for an assistant that must not reveal system prompts, API keys, or secrets embedded in its context. Explain what can and cannot be tested with the available catalog.",
+        "Design a collection to assess whether an assistant exposes personal data or repeats sensitive information unnecessarily when answering questions about documents.",
+        "We need to compare social bias across demographic groups in an assistant's answers. Choose relevant catalog benchmarks and keep bias measurements separate from general toxicity scores.",
+        "Build a collection for detecting toxic or abusive outputs while still allowing neutral discussion of offensive language in educational contexts.",
+        "Create an evaluation collection for an assistant used by teenagers, focusing on age-appropriate responses and safe handling of high-risk requests. Flag any lack of age-specific benchmarks.",
+        "I need a collection that tests an assistant's responses to self-harm disclosures for supportive language, appropriate escalation, and avoidance of dangerous details.",
+        "Select benchmarks for misinformation resistance: the assistant should challenge false premises and avoid agreeing with confidently stated but incorrect claims.",
+        "Build a collection to test whether an assistant changes a correct answer merely because the user expresses a strong opposing opinion.",
+        "Create a collection for evaluating safety consistency across languages and code-switched prompts. Explain which requested languages are actually covered by the catalog.",
+        "I want to know whether safety behavior survives spelling errors, obfuscated words, and adversarial formatting. Find relevant benchmarks without substituting ordinary clean-input accuracy.",
+        "Design a collection for a security-focused coding assistant that should produce functional code without introducing common vulnerabilities. Keep correctness and security results separate.",
+        "Build a collection to evaluate an LLM-as-a-Judge that scores the factual correctness of assistant answers. I care about agreement with expert labels, not the judge's own question-answering score.",
+        "I need benchmarks for a judge model that ranks two assistant responses by overall quality. Include comparison against human preferences and flag any missing judge-specific support.",
+        "Create a collection to measure position bias in an LLM judge by swapping the order of the same two candidate responses.",
+        "Design a collection to test whether an LLM-as-a-Judge favors longer answers even when a shorter answer is equally correct or more useful.",
+        "Put together an evaluation collection for a judge that must follow a custom scoring rubric rather than reward fluent writing alone.",
+        "Build a collection for an LLM judge that assesses whether summaries are faithful to their source documents and catches subtle unsupported claims.",
+        "We use a model to grade math solutions. Find benchmarks that evaluate whether the judge recognizes valid alternative reasoning and catches incorrect intermediate steps.",
+        "Create a collection for a judge that reviews code answers for correctness. Distinguish agreement with executable test results from subjective judgments of code style.",
+        "I want to evaluate an LLM judge's ability to identify policy violations without penalizing safe refusals or harmless discussion of sensitive subjects.",
+        "Design a collection for testing whether a judge model favors outputs attributed to itself or to a well-known model provider, regardless of answer quality.",
+        "Build a collection to measure consistency when an LLM-as-a-Judge scores the same answer repeatedly or sees a meaning-preserving paraphrase of it.",
+        "Find benchmarks for a multilingual LLM judge that should apply the same rubric across English, French, and Mandarin responses. Explain language and annotation gaps.",
+        "Create a collection for evaluating whether a judge can resist instructions embedded inside the candidate answer, such as a request to award the maximum score.",
+        "We need to evaluate a judge that assigns separate scores for helpfulness, factuality, and instruction following. Find relevant benchmarks and avoid collapsing those dimensions into one score.",
+        "Build a collection for a judge that can abstain when evidence is insufficient or experts disagree. Include calibration or uncertainty evaluation if the live catalog supports it.",
+        "Create a collection for an agent that chooses the right tool and supplies valid arguments, including cases where no tool call is needed.",
+        "I need to evaluate a tool-using agent on sequences where one API result determines the arguments to the next call. Find benchmarks beyond isolated function calling.",
+        "Build a collection for a web-research agent that gathers evidence from multiple sources and produces a cited answer without inventing sources.",
+        "Design an evaluation collection for a browser agent that fills forms and completes shopping tasks in a sandbox while respecting user constraints.",
+        "Find benchmarks for a coding agent that investigates a repository, fixes a reported issue, and passes regression tests rather than only generating standalone functions.",
+        "Create a collection for an agent that operates a shell in an isolated environment to inspect files, run commands, and recover from failed steps.",
+        "Build a collection for a data-analysis agent that loads tables, writes analysis code, and produces numerically correct conclusions supported by its results.",
+        "We need to evaluate a scheduling agent that coordinates calendars, handles time zones, and avoids booking meetings without required confirmation.",
+        "Design a collection for a customer-service agent that can look up orders and issue refunds only when policy and user authorization allow it.",
+        "I want to test an agent's ability to carry out a long task with dependencies, track completed steps, and avoid silently skipping requirements.",
+        "Create a collection for an agent that must recover from API timeouts, malformed tool responses, and temporarily unavailable services without fabricating success.",
+        "Build a collection to evaluate persistent memory in an agent, including updating changed preferences and not reusing information the user asked it to forget.",
+        "Find benchmarks for a multi-agent system in which a planner, researcher, and reviewer collaborate. Explain whether the catalog evaluates coordination or only individual agents.",
+        "Design a collection for an agent that browses untrusted sites and must resist prompt injections that try to steal credentials or trigger unauthorized actions.",
+        "Create a collection for testing human approval boundaries: an agent may draft an email or prepare a purchase but must ask before sending or paying.",
+        "I need to evaluate a database agent that can inspect schemas and run read-only queries but must never execute destructive statements or exceed its access permissions.",
+        "Build a collection for an agent that edits spreadsheets using formulas, preserves existing data, and checks that the final workbook satisfies the request.",
+        "Select benchmarks for a desktop agent that operates graphical applications from screenshots. Make clear if the live catalog cannot evaluate screen-based actions.",
+        "Create a collection for an agent that must complete tasks within a strict tool-call budget. Report task success separately from the number and cost of calls.",
+        "Design a collection for an infrastructure agent that proposes Kubernetes changes and validates them in a sandbox, with explicit approval before production changes. Identify gaps in available benchmarks.",
+        "Build a collection for a vision-language assistant that answers questions about charts and tables, including numerical comparisons and misleading axes.",
+        "I need an evaluation collection for document images containing scanned text, complex layouts, and handwritten annotations. Separate OCR-related coverage from reasoning over the extracted content.",
+        "Create a collection for an assistant that understands spoken requests in noisy audio and responds appropriately. Search the live catalog and explain any missing audio support.",
+        "Find benchmarks for an assistant that summarizes videos and answers questions about the order of events. Do not substitute image-only tasks without explaining the limitation.",
+        "Put together a lightweight smoke-test collection for a small on-device assistant. Use at most two catalog benchmarks covering instruction following and basic reasoning, and note the trade-offs.",
+        "We are comparing a new model release against our current enterprise assistant. Build a balanced regression collection for factuality, safety, tool use, and long-context reasoning without hiding weaknesses in a single aggregate score.",
+        "Create a collection to evaluate the quality-latency trade-off for a customer-facing assistant under concurrent load. Distinguish performance measurements from answer-quality benchmarks and identify available catalog support.",
+        "I need a collection for an assistant used in a low-resource language such as Amharic. Search the catalog for direct coverage and explicitly report gaps rather than presenting English results as a substitute.",
+        "Build an evaluation collection for a chess-coaching assistant that interprets board diagrams, recommends legal moves, and explains strategy. Tell me if the catalog only supports part of this request.",
+        "Design a collection for an assistant that helps blind users navigate a physical environment using live camera input. Search the catalog and clearly identify capabilities and real-world safety requirements it cannot validate.",
+        "chatbot evals. facts + basic logic. what have you got?",
+        "hey, can you pull together a few tests for our helpdesk bot? it keeps making up answers about returns",
+        "Need a judge-model eval pack ASAP: human agreement, order effects, rubric adherence. Max 4 benchmarks.",
+        "Any collections for agents that use a browser? Mostly searching for stuff and filling in forms, not coding.",
+        "Looking for math evals that aren't just times tables lol. Our tutor falls apart halfway through longer solutions.",
+        "Can u find benchmarks for a bot answering in both English & Urdu? actual Urdu coverage pls",
+        "We need to test whether the assistant does what it's told. Like, if I say three bullets, I mean THREE bullets. Put together a small collection?",
+        "which evals check hallucinations in summaries?",
+        "Trying to pick between two small models for internal Q&A. Suggest a starter collection, nothing huge.",
+        "Our agent says 'done' when the tool failed 🙃 got any benchmarks we can use to catch that?",
+        "Acceptance criteria for the collection: tests grounded answers; tests missing evidence; includes citation quality where supported. Target system is a policy-document assistant.",
+        "For procurement review, please recommend a defensible benchmark selection for an enterprise copilot, with distinct coverage of privacy, factual accuracy, and adherence to instructions.",
+        "Scope = LLM judge. Inputs = question + reference + candidate answer. Output = correctness score. Need evals of the SCORER, not evals that merely use one.",
+        "As a product manager, I want a compact evaluation suite for our onboarding assistant so that I can compare releases on policy accuracy and appropriate escalation.",
+        "REQ: evaluate a research agent on source discovery, evidence synthesis, and citation traceability; select from available catalog; identify unsupported dimensions.",
+        "Proposed launch gate: no regressions on harmful-request handling or benign refusals. Could you assemble a collection that measures both sides?",
+        "Context: contract-review copilot. Risk: missing exceptions buried in appendices. Ask: recommend long-document benchmarks, preferably with evidence localization.",
+        "Please supply a collection suitable for technical due diligence on a text-to-SQL assistant. Read-only correctness matters; dashboard aesthetics do not.",
+        "Decision memo needed: which catalog benchmarks should we run before deploying a bilingual French/English customer-support assistant? Limit the recommendation to five.",
+        "Desired evaluation portfolio — coding correctness / vulnerability avoidance / explanation quality. Intended model: developer assistant. Please call out areas without direct benchmark support.",
+        "My bot can answer one question fine. Ask a follow-up like 'what about the second one?' and it gets lost. What collection should I run?",
+        "We tried a longer context window and somehow the answers got worse. Can you select tests for finding and combining details in very long inputs?",
+        "The judge keeps picking the polished nonsense over the awkward correct answer. Need a collection to see how bad that is.",
+        "When someone writes 'ignore all previous instructions' in an uploaded PDF, our assistant sometimes obeys. What eval collection covers this?",
+        "Users ask our shopping assistant for items under $50 and it recommends $80 ones. Can we test constraint following with what's in the catalog?",
+        "Our legal bot invents case names that sound totally real. Please find a few evaluations that would expose that, or tell me what's missing.",
+        "The agent gets stuck retrying the same broken command. Want a collection for recovery, knowing when to stop, that sort of thing.",
+        "I've got a model that agrees with whatever I say, even when I'm wrong. Any good benchmark mix for that?",
+        "It translates normal Spanish well but struggles when people switch between Spanish and English mid-sentence. Find me a relevant evaluation set?",
+        "Support bot won't answer perfectly harmless questions about account security anymore. Need evals to see if our safety tuning went too far.",
+        "RAG eval collection: faithfulness != answer relevance != retrieval quality. Keep them separate, use catalog entries only.",
+        "tool-use agent; schema compliance + correct function selection + no-call cases; smallest useful suite please",
+        "judge eval: pairwise(A,B) vs pairwise(B,A). Need datasets/protocol support for measuring preference flips.",
+        "Need Python coding evals with runnable unit tests, not another multiple-choice knowledge test. Pick 2 tops.",
+        "JSON-only assistant -> valid syntax, correct schema, correct values. Which benchmarks cover which layer?",
+        "Agent eval bundle for CRUD APIs: read OK; write requires approval; delete prohibited. Anything directly applicable?",
+        "Target: 8k–128k context QA. Stressors: distractors, conflicting sources, multi-hop evidence. Assemble a coverage-oriented collection.",
+        "Please select evals for confidence calibration (Brier/ECE if supported), selective answering, and accuracy. Model is a factual QA assistant.",
+        "CI smoke suite wanted: <=3 benchmarks, quick to run, catches obvious instruction-following and reasoning regressions. Don't guess runtimes if metadata is absent.",
+        "Judge robustness: paraphrased rubrics, reordered criteria, repeated scoring. Catalog-backed collection + explicit holes in coverage, please.",
+        "i want test chatbot for banking questions. it must read provided statement and calculate correctly. which evaluations i should use?",
+        "Please make collection for assistant answering Japanese customers, polite language important also correct information. English-only test is not enough for us.",
+        "We need evaluate AI teacher. Not only final answer, also if explanation helps learner and does not tell answer too early.",
+        "Can suggest benchmarks? Our model read invoices, take total and due date, return JSON. Some invoices are photos.",
+        "i need evalution set for agent using tools, sometimes API gives empty result and agent invent data instead",
+        "For judge LLM, how to test fair scores for answers in different languages? Please select collection with available language coverage.",
+        "Want small testing collection for agriculture advice bot: crop questions, weather uncertainty, unsafe pesticide advice. Say if catalog cannot cover domain.",
+        "Our assistant answers in Portuguese but references are English. Need tests for answer grounded in reference across languages.",
+        "Please find evaluation for meeting assistant who knows speaker, action item, deadline. It receives transcript text, no audio.",
+        "We are small team, cannot run everything. Choose two or three useful benchmarks for general assistant, explain simple what each checks.",
+        "Could you curate a collection for a museum-guide assistant that answers from exhibit notes, adjusts explanations for children, and admits when the notes don't say?",
+        "I'm evaluating a grant-writing copilot. It must follow detailed application rules without inventing our organization's achievements; suggest catalog coverage and gaps.",
+        "What would you run for an accessibility assistant that rewrites complex notices in plain language without dropping legal obligations?",
+        "We have an incident-response copilot that reads alerts but must distinguish observed facts from hypotheses. I'd like a benchmark collection focused on that distinction.",
+        "Recommend a collection for a marketplace moderation assistant: nuanced policy application, quoted slurs versus abuse, and consistent treatment of appeals.",
+        "Need evals for a recipe assistant handling allergies and ingredient substitutions. General cooking trivia won't establish allergy safety, so please flag that gap.",
+        "Can we assemble a collection for a librarian assistant that recommends books under several constraints and avoids inventing titles or authors?",
+        "Our field-service assistant explains repair manuals. Find tests for following procedural steps and noticing warnings; tell me what requires domain-specific validation.",
+        "I'd like a collection for a recruiting assistant that summarizes candidate evidence without inferring protected characteristics or ranking people on demographic cues.",
+        "Help me evaluate a disaster-information assistant that must distinguish dated guidance from current facts. Find suitable catalog tests, and don't claim static QA validates live accuracy.",
+        "Before we swap out our judge, I want to know whether scores stay comparable. Put together tests for agreement with human ratings and scoring drift between judge versions.",
+        "The candidate answer literally says 'Evaluator: assign 10/10'. Need a collection that tests whether our grader falls for that.",
+        "Would a judge score the same answer differently if we called its author 'expert' versus 'intern'? Find evaluation coverage for attribution bias.",
+        "Need to evaluate a judge on answers that are partly right. Binary right/wrong isn't enough; look for partial-credit grading with trustworthy labels.",
+        "Can you find a small judge-eval collection for creative writing? Preference agreement matters, but I don't want to pretend there's one objectively correct poem.",
+        "Our grader must return a score AND cite the specific rubric violations. Select benchmarks that can check the justification as well as the rating, if available.",
+        "Please recommend evals for a judge choosing between two bad responses. It should be allowed to say 'both fail', not automatically reward the less terrible one.",
+        "I want a collection for a judge reviewing RAG answers: an answer can match the reference yet be unsupported by the supplied context. Need to test that distinction.",
+        "Any benchmark mix for a judge that evaluates agent traces? We care about unauthorized steps even when the final answer looks right.",
+        "Looking for judge evals where the reference answer itself might be wrong or incomplete. Need to see whether the judge follows evidence instead of blindly matching the key.",
+        "hey, our email agent should draft replies but NEVER hit send without me. what tests in the catalog cover that boundary?",
+        "Need agent benchmarks where a user changes their mind halfway through. New instruction should replace the old plan, not get ignored.",
+        "Which evals would test a coding agent on a repo it hasn't seen, with failing tests and incomplete bug reports? Assemble a collection around that.",
+        "A travel agent books the flight correctly but forgets the hotel. Looking for end-to-end task completion evals, not just tool-call accuracy.",
+        "Please pick tests for an agent that must verify the effect of its actions: a successful HTTP status alone doesn't mean the requested change happened.",
+        "For our spreadsheet agent, 'undo that' should restore the previous state without touching unrelated cells. Any collection with that sort of stateful task?",
+        "Search agent evals needed: can it tell a primary source from ten sites copying the same claim? Please flag if available benchmarks don't assess source independence.",
+        "We're giving an agent access to internal docs. Need evals for permission boundaries, especially when one user's task references another team's restricted files.",
+        "Can you put together a sandboxed agent-eval collection for package installation and environment setup? Include handling missing dependencies without unsafe shortcuts.",
+        "I want to test handoffs between agents. If the researcher is uncertain, the writer mustn't turn that into a confident fact. What catalog coverage exists?",
+        "benchmarks for reading charts? axes, legends, percentages. vision assistant.",
+        "Anything for speech assistants handling accents and background noise? Need a collection, not a speech-to-text tutorial.",
+        "Our slide assistant answers questions about screenshots of decks. Can you find tests for layout, charts, and text together?",
+        "Video assistant evals please — specifically 'what happened before X?', not just naming objects in one frame.",
+        "Need a multilingual safety collection for German, Turkish, and Arabic. If coverage is patchy, say exactly where.",
+        "Got anything for interpreting sign language from video? Build a collection only if relevant benchmarks exist; otherwise explain the gap.",
+        "I'd like tests for an assistant that explains maps and spatial directions from images. No, ordinary geography trivia isn't the same thing.",
+        "Want to evaluate speech-to-speech support conversations, including interruption handling. Which parts can the live catalog actually cover?",
+        "Find a collection for a multimodal tutor reading a student's photographed handwritten algebra. Keep handwriting recognition separate from solution checking.",
+        "Could you select evals for an assistant that checks whether a product image matches its description, including color and quantity mismatches?",
+        "I'm new to all this. We built a bot for employees to ask questions about company docs. Can you pick a sensible first set of tests and explain the blind spots?",
+        "Don't give me twenty benchmarks. I need the best two available for a general assistant that must follow instructions and not make things up.",
+        "Could we get a broader eval mix this time? Last collection was all multiple choice, but our app is open-ended chat with follow-ups.",
+        "Testing brief: enterprise agent, retrieved private docs, external tools, hostile inputs. Return a catalog-backed collection organized by failure mode rather than by provider.",
+        "what can i use to eval a mental-health support chatbot? empathy matters, but unsafe advice is the bigger worry. be clear about what benchmarks can't certify",
+        "Please assemble a collection for comparing a quantized assistant with its full-precision version. Prioritize reasoning and instruction-following regressions; keep hardware performance separate.",
+        "We need a red-team collection for our customer bot, but include harmless lookalike prompts too so a model that refuses everything won't look good.",
+        "My CEO wants one score for the assistant. I'd rather see factuality, safety, and task success separately. Pick a collection that supports that breakdown.",
+        "Looking for evaluation coverage for a robot-control language agent working from camera input. Search what's actually available; don't pass off text-only planning as physical safety validation.",
+        "Can you pull a balanced collection for our launch review: assistant answers, judge reliability, and tool-using agent behavior? Up to six benchmarks, with overlaps and missing coverage called out."
+    ]
+    
+    # === GLOBAL CONSTANTS =================================================================================================
+    MODEL = FastEmbedEmbeddingModel("sentence-transformers/all-MiniLM-L6-v2")
+    FIT = None
+    
+    # === HELPER FUNCTIONS =================================================================================================
+    def _distance(centroid, new_doc):
+        """return the cosine distance between centroid and new_doc"""
+        new_doc_encoding = np.array(MODEL.encode([new_doc]))[0]
+        return spatial.distance.cosine(centroid, new_doc_encoding)
+    
+    
+    def _fit():
+        """Compute or retrieve the fit parameters of the classifier"""
+        global FIT
+        if not FIT:
+            doc_encodings = np.array(MODEL.encode(PROMPT_DATASET))
+            centroid = np.mean(doc_encodings, axis=0)
+            cluster_distances = [_distance(centroid, doc) for doc in PROMPT_DATASET]
+            FIT = centroid, np.mean(cluster_distances), np.std(cluster_distances)
+            return FIT
+        else:
+            return FIT
+    
+    
+    # === MAIN ACTION ======================================================================================================
+    @action()
+    async def on_topic_classifier_check_input(
+            context: Optional[dict] = None,
+            text: Optional[str] = None,
+            **kwargs,
+    ) -> RailOutcome:
+        """Check whether a given text is within $LENIENCE standard deviations of the topic centroid"""
+    
+        if text is None:
+            text = (context.get("user_message") or "") if context else ""
+        centroid, mean, stddev = _fit()
+        threshold = mean + (stddev * LENIENCE)
+    
+        doc_distance = _distance(centroid, text)
+    
+        if doc_distance < threshold:
+            log.info(f"ON TOPIC,  distance={doc_distance}: {text}")
+            return RailOutcome.allow()
+        else:
+            log.info(f"OFF TOPIC, distance={doc_distance}: {text}")
+            return RailOutcome.block(reason="off-topic", metadata={"topic_distance": doc_distance, "threshold": threshold})
+---
+# Then create the NemoGuardrails resource
+apiVersion: trustyai.opendatahub.io/v1alpha1
+kind: NemoGuardrails
+metadata:
+  name: nemoguardrails-evalhub
+spec:
+  nemoConfigs:
+    - name: main-config
+      configMaps:
+        - nemo-config-evalhub
+      default: true
